@@ -35,6 +35,7 @@ import json
 import pandas as pd
 import numpy as np
 import time
+import re
 import functools
 import argparse
 from typing import Dict, List, Tuple
@@ -539,15 +540,62 @@ class Part1Evaluator:
         
         return self.code_texts, self.y
     
-    def extract_features(self, code_texts: List[str]) -> np.ndarray:
-        """Extract 10 code-specific features (placeholder)"""
+    def extract_features(self, code_texts: List[str], analyzer=None, feature_names: List[str] = None) -> np.ndarray:
+        """
+        Extract 10 code-specific features for Part 1.
+        Prefer AICodeAnalyzer when available; otherwise use deterministic
+        lightweight lexical/statistical fallback features.
+        """
         print("\n  [Feature Extraction]")
-        print("  Feature extraction not implemented (requires CodeBERT preprocessing)")
-        print("  Using perplexity-only feature matrix for GPTZero/DetectGPT evaluation")
+        if feature_names is None:
+            feature_names = [
+                'perplexity', 'avg_token_probability', 'avg_entropy',
+                'burstiness', 'code_length', 'avg_line_length',
+                'std_line_length', 'comment_ratio', 'identifier_entropy',
+                'ngram_repetition'
+            ]
         
-        # For now, return dummy features (just perplexity placeholder)
-        n_samples = len(code_texts)
-        X = np.random.randn(n_samples, 10)
+        rows = []
+        use_analyzer = analyzer is not None
+        if use_analyzer:
+            print("  Using AICodeAnalyzer for feature extraction")
+        else:
+            print("  AICodeAnalyzer unavailable; using lexical fallback features")
+        
+        for i, code in enumerate(code_texts):
+            try:
+                if use_analyzer:
+                    extracted = analyzer.analyze_code(code) or {}
+                    row = [float(extracted.get(name, 0.0)) for name in feature_names]
+                else:
+                    lines = code.splitlines() if code else []
+                    line_lengths = np.array([len(ln) for ln in lines], dtype=np.float32) if lines else np.array([0.0], dtype=np.float32)
+                    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", code or "")
+                    token_count = len(tokens)
+                    unique_tokens = len(set(tokens))
+                    probs = np.array([tokens.count(t) / max(token_count, 1) for t in set(tokens)], dtype=np.float32)
+                    identifier_entropy = float(-np.sum(probs * np.log2(np.clip(probs, 1e-8, 1.0)))) if len(probs) else 0.0
+                    comments = sum(1 for ln in lines if ln.strip().startswith('#') or ln.strip().startswith('//'))
+                    comment_ratio = comments / max(len(lines), 1)
+                    ngrams = [" ".join(tokens[j:j+3]) for j in range(max(0, token_count - 2))]
+                    ngram_repetition = 1.0 - (len(set(ngrams)) / max(len(ngrams), 1)) if ngrams else 0.0
+                    row = [
+                        0.0, 0.0, 0.0,  # perplexity/avg_prob/entropy unavailable without analyzer
+                        float(np.std(line_lengths)),  # burstiness proxy
+                        float(len(code or "")),
+                        float(np.mean(line_lengths)),
+                        float(np.std(line_lengths)),
+                        float(comment_ratio),
+                        float(identifier_entropy),
+                        float(ngram_repetition),
+                    ]
+                rows.append(row)
+            except Exception as e:
+                print(f"  Warning: feature extraction failed for sample {i}: {e}")
+                rows.append([0.0] * len(feature_names))
+        
+        X = np.array(rows, dtype=np.float32)
+        print(f"  ✓ Extracted feature matrix: {X.shape}")
         return X
     
     def run_stratified_kfold(self, gptzero, detectgpt, codebert, n_splits=5):
@@ -1275,9 +1323,13 @@ class ImprovedComparisonExperiment:
                 human_path
             )
             
-            # Extract features (optional - not implemented for now)
-            # X = self.part1_evaluator.extract_features(code_texts)
-            # self.part1_evaluator.X = X
+            # Extract features so CodeBERT can also participate in Part 1 5-fold.
+            X = self.part1_evaluator.extract_features(
+                code_texts,
+                analyzer=codebert.analyzer,
+                feature_names=codebert.feature_names
+            )
+            self.part1_evaluator.X = X
             
             fold_results = self.part1_evaluator.run_stratified_kfold(
                 gptzero, detectgpt, codebert, n_splits=5
