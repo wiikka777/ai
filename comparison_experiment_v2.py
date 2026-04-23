@@ -21,9 +21,13 @@ Goal: Prove that AI code detection requires specialized code language models
 import os
 # Force CPU-only for this script unless user explicitly overrides
 os.environ['CUDA_VISIBLE_DEVICES'] = ''
-# Use environment variable if set, otherwise use default cache location
+# Use environment variable if set, otherwise prefer a local setup cache path.
+_preferred_hf_home = r'C:\Users\Accio\Desktop\ai-test-master\scripts\setup\hf_cache'
 if 'HF_HOME' not in os.environ:
-    os.environ['HF_HOME'] = os.path.expanduser('~/.cache/huggingface')
+    if os.path.exists(_preferred_hf_home):
+        os.environ['HF_HOME'] = _preferred_hf_home
+    else:
+        os.environ['HF_HOME'] = os.path.expanduser('~/.cache/huggingface')
 if 'TRANSFORMERS_CACHE' not in os.environ:
     os.environ['TRANSFORMERS_CACHE'] = os.environ['HF_HOME']
 
@@ -31,6 +35,7 @@ import json
 import pandas as pd
 import numpy as np
 import time
+import re
 import functools
 import argparse
 from typing import Dict, List, Tuple
@@ -101,6 +106,10 @@ if not DETECTGPT_AVAILABLE:
 AICODEANALYZER_AVAILABLE = False
 AICodeAnalyzer = None
 _analyzer_paths = [
+    # Local repository paths (preferred in this project)
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'method.py'),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core', 'method.py'),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'core', 'method.py'),
     r'C:\Users\Accio\Desktop\ai-test-master\core\method.py',
     os.path.expanduser('~/core/method.py'),
     os.path.expanduser('~/method.py'),
@@ -137,7 +146,8 @@ class GPTZeroApproach:
             try:
                 self.model = GPT2PPL(device=device, model_id="gpt2")
                 self.use_gpt2 = True
-            except:
+            except Exception as e:
+                print(f"Warning: GPTZero model init failed, fallback mode enabled: {e}")
                 self.use_gpt2 = False
         else:
             self.use_gpt2 = False
@@ -146,8 +156,25 @@ class GPTZeroApproach:
         if not self.use_gpt2:
             return 0.0
         try:
-            ppl = self.model(text)
-            return float(ppl) if ppl else 0.0
+            if len(text) < 20:
+                return 0.0
+            
+            raw_result = self.model(text)
+            
+            # GPTZero implementation commonly returns:
+            #   (result_dict, verdict_str)
+            # where result_dict includes "Perplexity per line".
+            if isinstance(raw_result, tuple):
+                result = raw_result[0] if len(raw_result) > 0 else None
+            else:
+                result = raw_result
+            
+            if isinstance(result, dict):
+                ppl = result.get("Perplexity per line", result.get("Perplexity", 0.0))
+                return float(ppl) if ppl is not None else 0.0
+            
+            # Fallback for wrappers returning a direct numeric perplexity
+            return float(result) if result else 0.0
         except Exception as e:
             return 0.0
     
@@ -192,7 +219,8 @@ class DetectGPTApproach:
         self.chunk_value = chunk_value
         self.threshold = 0.7
         self.max_chars = 5000
-        self.max_words = 500
+        # Keep DetectGPT reasonably fast for Part 2 smoke tests on CPU.
+        self.max_words = 220
         self.max_tokens = 512
         self.min_words_for_perturbation = 50
         
@@ -200,7 +228,8 @@ class DetectGPTApproach:
             try:
                 self.model = GPT2PPLV2(device=device)
                 self.use_detectgpt = True
-            except:
+            except Exception as e:
+                print(f"Warning: DetectGPT model init failed, fallback mode enabled: {e}")
                 self.use_detectgpt = False
         else:
             self.use_detectgpt = False
@@ -225,16 +254,24 @@ class DetectGPTApproach:
         
         try:
             print(f"    [DetectGPT] Computing score for text length {len(text)}...")
-            result = self.model(text, self.chunk_value, "v1.1")
-            print(f"    [DetectGPT] Model result: {result}")
+            raw_result = self.model(text, self.chunk_value, "v1.1")
+            print(f"    [DetectGPT] Model result: {raw_result}")
+            
+            # DetectGPT v1.1 commonly returns: (result_dict, verdict_str)
+            # but some wrappers may return only result_dict.
+            if isinstance(raw_result, tuple):
+                result = raw_result[0] if len(raw_result) > 0 else None
+            else:
+                result = raw_result
+            
             if not isinstance(result, dict):
-                print(f"    [DetectGPT] Result not dict, returning fallback")
+                print(f"    [DetectGPT] Result not dict after normalization, returning fallback")
                 return (0, 0.5)
             
             detectgpt_label = result.get('label', 1)
             prob_str = result.get('prob', '50.00%')
             try:
-                prob = float(prob_str.strip('%')) / 100.0
+                prob = float(str(prob_str).replace('%', '').strip()) / 100.0
             except:
                 prob = 0.5
             prob = min(max(prob, 0.0), 1.0)
@@ -267,7 +304,8 @@ class DetectGPTApproach:
     
     def batch_predict(self, X, code_texts: List[str] = None, label: str = "") -> List[Tuple[int, float]]:
         SLOW_THRESHOLD = 30
-        MAX_HARD_SAMPLE_CHARS = 4000
+        # Skip very long samples in TEST mode to avoid 5-10 minute single samples.
+        MAX_HARD_SAMPLE_CHARS = 1200
         MAX_HARD_SAMPLE_LINES = 300
         is_test = "TEST" in label
         
@@ -279,6 +317,7 @@ class DetectGPTApproach:
         errors = 0
         slow_count = 0
         skipped_hard = 0
+        neutral_fallback = 0
         
         for i, (row, c) in enumerate(zip(X, code_texts)):
             if (i + 1) % max(1, len(X) // 10) == 0:
@@ -290,9 +329,30 @@ class DetectGPTApproach:
                 if len(c) > MAX_HARD_SAMPLE_CHARS and is_test:
                     skipped_hard += 1
                     results.append((0, 0.5))
+                    print(f"      [DetectGPT] Sample {i} skipped: too long ({len(c)} chars)")
                 else:
-                    pred = self.predict(row, c)
+                    if self.use_detectgpt:
+                        cleaned_words = len(" ".join(c.split()).split()) if c else 0
+                        if len(c.strip()) < 20:
+                            pred = (0, 0.5)
+                            if is_test:
+                                print(f"      [DetectGPT] Sample {i} fallback: text too short")
+                        elif cleaned_words < self.min_words_for_perturbation:
+                            pred = (0, 0.5)
+                            if is_test:
+                                print(
+                                    f"      [DetectGPT] Sample {i} fallback: "
+                                    f"insufficient words ({cleaned_words} < {self.min_words_for_perturbation})"
+                                )
+                        else:
+                            pred = self.predict(row, c)
+                    else:
+                        pred = self.predict(row, c)
+                        if is_test:
+                            print("      [DetectGPT] Fallback mode active: model unavailable")
                     results.append(pred)
+                    if pred == (0, 0.5):
+                        neutral_fallback += 1
                 
                 sample_elapsed = time.time() - sample_t0
                 if sample_elapsed > SLOW_THRESHOLD:
@@ -302,7 +362,10 @@ class DetectGPTApproach:
                 errors += 1
                 results.append((0, 0.5))
         
-        print(f"    DetectGPT done: {len(results)}/{len(X)}, {errors} errors, {slow_count} slow, {skipped_hard} skipped")
+        print(
+            f"    DetectGPT done: {len(results)}/{len(X)}, {errors} errors, "
+            f"{slow_count} slow, {skipped_hard} skipped, {neutral_fallback} neutral-fallback"
+        )
         return results
 
 
@@ -362,6 +425,7 @@ class CodeBERTApproach:
             self._train_on_default_data()
             if self.model is None:
                 return [(0, 0.5)] * len(code_texts)
+            print("[CodeBERT] Analyzer/model ready, running feature extraction...")
         
         features_list = []
         for i, code in enumerate(code_texts):
@@ -476,15 +540,62 @@ class Part1Evaluator:
         
         return self.code_texts, self.y
     
-    def extract_features(self, code_texts: List[str]) -> np.ndarray:
-        """Extract 10 code-specific features (placeholder)"""
+    def extract_features(self, code_texts: List[str], analyzer=None, feature_names: List[str] = None) -> np.ndarray:
+        """
+        Extract 10 code-specific features for Part 1.
+        Prefer AICodeAnalyzer when available; otherwise use deterministic
+        lightweight lexical/statistical fallback features.
+        """
         print("\n  [Feature Extraction]")
-        print("  Feature extraction not implemented (requires CodeBERT preprocessing)")
-        print("  Using perplexity-only feature matrix for GPTZero/DetectGPT evaluation")
+        if feature_names is None:
+            feature_names = [
+                'perplexity', 'avg_token_probability', 'avg_entropy',
+                'burstiness', 'code_length', 'avg_line_length',
+                'std_line_length', 'comment_ratio', 'identifier_entropy',
+                'ngram_repetition'
+            ]
         
-        # For now, return dummy features (just perplexity placeholder)
-        n_samples = len(code_texts)
-        X = np.random.randn(n_samples, 10)
+        rows = []
+        use_analyzer = analyzer is not None
+        if use_analyzer:
+            print("  Using AICodeAnalyzer for feature extraction")
+        else:
+            print("  AICodeAnalyzer unavailable; using lexical fallback features")
+        
+        for i, code in enumerate(code_texts):
+            try:
+                if use_analyzer:
+                    extracted = analyzer.analyze_code(code) or {}
+                    row = [float(extracted.get(name, 0.0)) for name in feature_names]
+                else:
+                    lines = code.splitlines() if code else []
+                    line_lengths = np.array([len(ln) for ln in lines], dtype=np.float32) if lines else np.array([0.0], dtype=np.float32)
+                    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", code or "")
+                    token_count = len(tokens)
+                    unique_tokens = len(set(tokens))
+                    probs = np.array([tokens.count(t) / max(token_count, 1) for t in set(tokens)], dtype=np.float32)
+                    identifier_entropy = float(-np.sum(probs * np.log2(np.clip(probs, 1e-8, 1.0)))) if len(probs) else 0.0
+                    comments = sum(1 for ln in lines if ln.strip().startswith('#') or ln.strip().startswith('//'))
+                    comment_ratio = comments / max(len(lines), 1)
+                    ngrams = [" ".join(tokens[j:j+3]) for j in range(max(0, token_count - 2))]
+                    ngram_repetition = 1.0 - (len(set(ngrams)) / max(len(ngrams), 1)) if ngrams else 0.0
+                    row = [
+                        0.0, 0.0, 0.0,  # perplexity/avg_prob/entropy unavailable without analyzer
+                        float(np.std(line_lengths)),  # burstiness proxy
+                        float(len(code or "")),
+                        float(np.mean(line_lengths)),
+                        float(np.std(line_lengths)),
+                        float(comment_ratio),
+                        float(identifier_entropy),
+                        float(ngram_repetition),
+                    ]
+                rows.append(row)
+            except Exception as e:
+                print(f"  Warning: feature extraction failed for sample {i}: {e}")
+                rows.append([0.0] * len(feature_names))
+        
+        X = np.array(rows, dtype=np.float32)
+        print(f"  ✓ Extracted feature matrix: {X.shape}")
         return X
     
     def run_stratified_kfold(self, gptzero, detectgpt, codebert, n_splits=5):
@@ -622,8 +733,8 @@ class Part2Evaluator:
         self.preds_codebert_runs = []
         self.sample_indices_runs = []  # Store which samples were used in each run
     
-    def load_full_dataset(self, full_data_path: str, sample_size: int = 50) -> List[str]:
-        """Load 44k code samples from last_success, then randomly sample 50"""
+    def load_full_dataset(self, full_data_path: str, sample_size: int = 10) -> List[str]:
+        """Load 44k code samples from last_success, then randomly sample sample_size."""
         print("\n[Part 2] Loading full dataset...")
         
         with open(full_data_path, 'r', encoding='utf-8') as f:
@@ -636,7 +747,7 @@ class Part2Evaluator:
         all_code_texts = [row[content_idx] for row in data[1:]]
         print(f" Loaded {len(all_code_texts)} total code samples")
         
-        # Randomly sample 5000 samples
+        # Randomly sample target samples for quick analysis
         if len(all_code_texts) > sample_size:
             np.random.seed(42)  # For reproducibility
             indices = np.random.choice(len(all_code_texts), sample_size, replace=False)
@@ -820,8 +931,8 @@ class Part2Evaluator:
         print(f"    GPTZero <-> DetectGPT agreement: {100*avg_agreement:6.2f}% ± {100*std_agreement:4.2f}%")
         
         print(f"\n  Sample Categories (averaged):")
-        print(f"    Both predict AI:    {avg_both_ai:6.1f} (high confidence)")
-        print(f"    Both predict Human: {avg_both_human:6.1f} (high confidence)")
+        print(f"    Both predict AI:    {avg_both_ai:6.1f}")
+        print(f"    Both predict Human: {avg_both_human:6.1f}")
         print(f"    Conflict/Disagree:  {avg_conflict:6.1f} (needs review)")
         
         print(f"\n  Confidence-weighted Agreement (averaged):")
@@ -1156,6 +1267,14 @@ class ImprovedComparisonExperiment:
         self.part1_evaluator = Part1Evaluator()
         self.part2_evaluator = Part2Evaluator()
         self.results = {}
+
+    @staticmethod
+    def _safe_init(cls, *args, **kwargs):
+        """Backward-compatible class initializer for detector wrappers."""
+        try:
+            return cls(*args, **kwargs)
+        except TypeError:
+            return cls()
     
     def run_full_experiment(self, device=None, sample_size=None, part1_only=False, part2_only=False, output_dir: str = None):
         """Run complete experiment"""
@@ -1182,8 +1301,8 @@ class ImprovedComparisonExperiment:
         
         # Initialize the three detector approaches
         print("\n[Initializing detectors...]")
-        gptzero = GPTZeroApproach(device=device)
-        detectgpt = DetectGPTApproach(device=device)
+        gptzero = self._safe_init(GPTZeroApproach, device=device)
+        detectgpt = self._safe_init(DetectGPTApproach, device=device)
         codebert = CodeBERTApproach()
         print("[Detectors initialized]")
         
@@ -1204,9 +1323,13 @@ class ImprovedComparisonExperiment:
                 human_path
             )
             
-            # Extract features (optional - not implemented for now)
-            # X = self.part1_evaluator.extract_features(code_texts)
-            # self.part1_evaluator.X = X
+            # Extract features so CodeBERT can also participate in Part 1 5-fold.
+            X = self.part1_evaluator.extract_features(
+                code_texts,
+                analyzer=codebert.analyzer,
+                feature_names=codebert.feature_names
+            )
+            self.part1_evaluator.X = X
             
             fold_results = self.part1_evaluator.run_stratified_kfold(
                 gptzero, detectgpt, codebert, n_splits=5
@@ -1227,7 +1350,7 @@ class ImprovedComparisonExperiment:
             
             code_texts = self.part2_evaluator.load_full_dataset(
                 full_dataset_path,
-                sample_size=sample_size if sample_size is not None else 50
+                sample_size=sample_size if sample_size is not None else 10
             )
             
             preds_gz, preds_dg, preds_cb = self.part2_evaluator.run_three_detectors(
@@ -1498,8 +1621,8 @@ class ImprovedComparisonExperiment:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Improved AI Code Detection Comparison')
     parser.add_argument('--device', type=str, default=None, choices=['cuda', 'cpu'])
-    parser.add_argument('--sample_size', type=int, default=None, 
-                        help='Sample size for Part 2 (None=use all 44k)')
+    parser.add_argument('--sample_size', type=int, default=10,
+                        help='Sample size for Part 2 (default: 10 for smoke test)')
     parser.add_argument('--part1_only', action='store_true', help='Run Part 1 only')
     parser.add_argument('--part2_only', action='store_true', help='Run Part 2 only')
     parser.add_argument('--output_dir', type=str, default=None,
