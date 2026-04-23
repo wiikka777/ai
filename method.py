@@ -12,6 +12,15 @@ os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['SAFETENSORS_FORCE_CONVERT'] = '0'
 
+# Prefer local setup cache path if available (Windows local run),
+# otherwise keep Hugging Face defaults unless user already set env vars.
+_preferred_hf_home = r'C:\Users\Accio\Desktop\ai-test-master\scripts\setup\hf_cache'
+if 'HF_HOME' not in os.environ:
+    if os.path.exists(_preferred_hf_home):
+        os.environ['HF_HOME'] = _preferred_hf_home
+if 'TRANSFORMERS_CACHE' not in os.environ and 'HF_HOME' in os.environ:
+    os.environ['TRANSFORMERS_CACHE'] = os.environ['HF_HOME']
+
 class AICodeAnalyzer:
     """
     AICodeAnalyzer Used to estimate the perplexity of code under a pre-trained code language model, 
@@ -30,7 +39,6 @@ class AICodeAnalyzer:
         self.model = AutoModelForMaskedLM.from_pretrained(
             model_name,
             trust_remote_code=True,
-            use_safetensors=False,
             local_files_only=True
         ).to(self.device)
         self.model.eval()
