@@ -883,8 +883,8 @@ class Part2Evaluator:
         print(f"    GPTZero <-> DetectGPT agreement: {100*avg_agreement:6.2f}% ± {100*std_agreement:4.2f}%")
         
         print(f"\n  Sample Categories (averaged):")
-        print(f"    Both predict AI:    {avg_both_ai:6.1f} (high confidence)")
-        print(f"    Both predict Human: {avg_both_human:6.1f} (high confidence)")
+        print(f"    Both predict AI:    {avg_both_ai:6.1f}")
+        print(f"    Both predict Human: {avg_both_human:6.1f}")
         print(f"    Conflict/Disagree:  {avg_conflict:6.1f} (needs review)")
         
         print(f"\n  Confidence-weighted Agreement (averaged):")
