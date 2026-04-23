@@ -328,8 +328,27 @@ class DetectGPTApproach:
                 if len(c) > MAX_HARD_SAMPLE_CHARS and is_test:
                     skipped_hard += 1
                     results.append((0, 0.5))
+                    print(f"      [DetectGPT] Sample {i} skipped: too long ({len(c)} chars)")
                 else:
-                    pred = self.predict(row, c)
+                    if self.use_detectgpt:
+                        cleaned_words = len(" ".join(c.split()).split()) if c else 0
+                        if len(c.strip()) < 20:
+                            pred = (0, 0.5)
+                            if is_test:
+                                print(f"      [DetectGPT] Sample {i} fallback: text too short")
+                        elif cleaned_words < self.min_words_for_perturbation:
+                            pred = (0, 0.5)
+                            if is_test:
+                                print(
+                                    f"      [DetectGPT] Sample {i} fallback: "
+                                    f"insufficient words ({cleaned_words} < {self.min_words_for_perturbation})"
+                                )
+                        else:
+                            pred = self.predict(row, c)
+                    else:
+                        pred = self.predict(row, c)
+                        if is_test:
+                            print("      [DetectGPT] Fallback mode active: model unavailable")
                     results.append(pred)
                     if pred == (0, 0.5):
                         neutral_fallback += 1
