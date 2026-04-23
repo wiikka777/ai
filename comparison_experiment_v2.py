@@ -316,6 +316,7 @@ class DetectGPTApproach:
         errors = 0
         slow_count = 0
         skipped_hard = 0
+        neutral_fallback = 0
         
         for i, (row, c) in enumerate(zip(X, code_texts)):
             if (i + 1) % max(1, len(X) // 10) == 0:
@@ -330,6 +331,8 @@ class DetectGPTApproach:
                 else:
                     pred = self.predict(row, c)
                     results.append(pred)
+                    if pred == (0, 0.5):
+                        neutral_fallback += 1
                 
                 sample_elapsed = time.time() - sample_t0
                 if sample_elapsed > SLOW_THRESHOLD:
@@ -339,7 +342,10 @@ class DetectGPTApproach:
                 errors += 1
                 results.append((0, 0.5))
         
-        print(f"    DetectGPT done: {len(results)}/{len(X)}, {errors} errors, {slow_count} slow, {skipped_hard} skipped")
+        print(
+            f"    DetectGPT done: {len(results)}/{len(X)}, {errors} errors, "
+            f"{slow_count} slow, {skipped_hard} skipped, {neutral_fallback} neutral-fallback"
+        )
         return results
 
 
@@ -399,6 +405,7 @@ class CodeBERTApproach:
             self._train_on_default_data()
             if self.model is None:
                 return [(0, 0.5)] * len(code_texts)
+            print("[CodeBERT] Analyzer/model ready, running feature extraction...")
         
         features_list = []
         for i, code in enumerate(code_texts):
