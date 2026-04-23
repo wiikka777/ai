@@ -106,6 +106,7 @@ if not DETECTGPT_AVAILABLE:
 AICODEANALYZER_AVAILABLE = False
 AICodeAnalyzer = None
 _analyzer_paths = [
+    r'C:\Users\Accio\Desktop\ai-test-master\core\method.py',
     # Local repository paths (preferred in this project)
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'method.py'),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core', 'method.py'),
