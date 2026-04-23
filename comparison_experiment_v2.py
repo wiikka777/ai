@@ -35,6 +35,7 @@ import json
 import pandas as pd
 import numpy as np
 import time
+import re
 import functools
 import argparse
 from typing import Dict, List, Tuple
@@ -110,6 +111,7 @@ _analyzer_paths = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'method.py'),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core', 'method.py'),
     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'core', 'method.py'),
+    r'C:\Users\Accio\Desktop\ai-test-master\core\method.py',
     os.path.expanduser('~/core/method.py'),
     os.path.expanduser('~/method.py'),
 ]
@@ -145,7 +147,8 @@ class GPTZeroApproach:
             try:
                 self.model = GPT2PPL(device=device, model_id="gpt2")
                 self.use_gpt2 = True
-            except:
+            except Exception as e:
+                print(f"Warning: GPTZero model init failed, fallback mode enabled: {e}")
                 self.use_gpt2 = False
         else:
             self.use_gpt2 = False
@@ -217,7 +220,8 @@ class DetectGPTApproach:
         self.chunk_value = chunk_value
         self.threshold = 0.7
         self.max_chars = 5000
-        self.max_words = 500
+        # Keep DetectGPT reasonably fast for Part 2 smoke tests on CPU.
+        self.max_words = 220
         self.max_tokens = 512
         self.min_words_for_perturbation = 50
         
@@ -225,7 +229,8 @@ class DetectGPTApproach:
             try:
                 self.model = GPT2PPLV2(device=device)
                 self.use_detectgpt = True
-            except:
+            except Exception as e:
+                print(f"Warning: DetectGPT model init failed, fallback mode enabled: {e}")
                 self.use_detectgpt = False
         else:
             self.use_detectgpt = False
@@ -300,7 +305,8 @@ class DetectGPTApproach:
     
     def batch_predict(self, X, code_texts: List[str] = None, label: str = "") -> List[Tuple[int, float]]:
         SLOW_THRESHOLD = 30
-        MAX_HARD_SAMPLE_CHARS = 4000
+        # Skip very long samples in TEST mode to avoid 5-10 minute single samples.
+        MAX_HARD_SAMPLE_CHARS = 1200
         MAX_HARD_SAMPLE_LINES = 300
         is_test = "TEST" in label
         
@@ -312,6 +318,7 @@ class DetectGPTApproach:
         errors = 0
         slow_count = 0
         skipped_hard = 0
+        neutral_fallback = 0
         
         for i, (row, c) in enumerate(zip(X, code_texts)):
             if (i + 1) % max(1, len(X) // 10) == 0:
@@ -323,9 +330,30 @@ class DetectGPTApproach:
                 if len(c) > MAX_HARD_SAMPLE_CHARS and is_test:
                     skipped_hard += 1
                     results.append((0, 0.5))
+                    print(f"      [DetectGPT] Sample {i} skipped: too long ({len(c)} chars)")
                 else:
-                    pred = self.predict(row, c)
+                    if self.use_detectgpt:
+                        cleaned_words = len(" ".join(c.split()).split()) if c else 0
+                        if len(c.strip()) < 20:
+                            pred = (0, 0.5)
+                            if is_test:
+                                print(f"      [DetectGPT] Sample {i} fallback: text too short")
+                        elif cleaned_words < self.min_words_for_perturbation:
+                            pred = (0, 0.5)
+                            if is_test:
+                                print(
+                                    f"      [DetectGPT] Sample {i} fallback: "
+                                    f"insufficient words ({cleaned_words} < {self.min_words_for_perturbation})"
+                                )
+                        else:
+                            pred = self.predict(row, c)
+                    else:
+                        pred = self.predict(row, c)
+                        if is_test:
+                            print("      [DetectGPT] Fallback mode active: model unavailable")
                     results.append(pred)
+                    if pred == (0, 0.5):
+                        neutral_fallback += 1
                 
                 sample_elapsed = time.time() - sample_t0
                 if sample_elapsed > SLOW_THRESHOLD:
@@ -335,7 +363,10 @@ class DetectGPTApproach:
                 errors += 1
                 results.append((0, 0.5))
         
-        print(f"    DetectGPT done: {len(results)}/{len(X)}, {errors} errors, {slow_count} slow, {skipped_hard} skipped")
+        print(
+            f"    DetectGPT done: {len(results)}/{len(X)}, {errors} errors, "
+            f"{slow_count} slow, {skipped_hard} skipped, {neutral_fallback} neutral-fallback"
+        )
         return results
 
 
@@ -395,6 +426,7 @@ class CodeBERTApproach:
             self._train_on_default_data()
             if self.model is None:
                 return [(0, 0.5)] * len(code_texts)
+            print("[CodeBERT] Analyzer/model ready, running feature extraction...")
         
         features_list = []
         for i, code in enumerate(code_texts):
@@ -509,15 +541,62 @@ class Part1Evaluator:
         
         return self.code_texts, self.y
     
-    def extract_features(self, code_texts: List[str]) -> np.ndarray:
-        """Extract 10 code-specific features (placeholder)"""
+    def extract_features(self, code_texts: List[str], analyzer=None, feature_names: List[str] = None) -> np.ndarray:
+        """
+        Extract 10 code-specific features for Part 1.
+        Prefer AICodeAnalyzer when available; otherwise use deterministic
+        lightweight lexical/statistical fallback features.
+        """
         print("\n  [Feature Extraction]")
-        print("  Feature extraction not implemented (requires CodeBERT preprocessing)")
-        print("  Using perplexity-only feature matrix for GPTZero/DetectGPT evaluation")
+        if feature_names is None:
+            feature_names = [
+                'perplexity', 'avg_token_probability', 'avg_entropy',
+                'burstiness', 'code_length', 'avg_line_length',
+                'std_line_length', 'comment_ratio', 'identifier_entropy',
+                'ngram_repetition'
+            ]
         
-        # For now, return dummy features (just perplexity placeholder)
-        n_samples = len(code_texts)
-        X = np.random.randn(n_samples, 10)
+        rows = []
+        use_analyzer = analyzer is not None
+        if use_analyzer:
+            print("  Using AICodeAnalyzer for feature extraction")
+        else:
+            print("  AICodeAnalyzer unavailable; using lexical fallback features")
+        
+        for i, code in enumerate(code_texts):
+            try:
+                if use_analyzer:
+                    extracted = analyzer.analyze_code(code) or {}
+                    row = [float(extracted.get(name, 0.0)) for name in feature_names]
+                else:
+                    lines = code.splitlines() if code else []
+                    line_lengths = np.array([len(ln) for ln in lines], dtype=np.float32) if lines else np.array([0.0], dtype=np.float32)
+                    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", code or "")
+                    token_count = len(tokens)
+                    unique_tokens = len(set(tokens))
+                    probs = np.array([tokens.count(t) / max(token_count, 1) for t in set(tokens)], dtype=np.float32)
+                    identifier_entropy = float(-np.sum(probs * np.log2(np.clip(probs, 1e-8, 1.0)))) if len(probs) else 0.0
+                    comments = sum(1 for ln in lines if ln.strip().startswith('#') or ln.strip().startswith('//'))
+                    comment_ratio = comments / max(len(lines), 1)
+                    ngrams = [" ".join(tokens[j:j+3]) for j in range(max(0, token_count - 2))]
+                    ngram_repetition = 1.0 - (len(set(ngrams)) / max(len(ngrams), 1)) if ngrams else 0.0
+                    row = [
+                        0.0, 0.0, 0.0,  # perplexity/avg_prob/entropy unavailable without analyzer
+                        float(np.std(line_lengths)),  # burstiness proxy
+                        float(len(code or "")),
+                        float(np.mean(line_lengths)),
+                        float(np.std(line_lengths)),
+                        float(comment_ratio),
+                        float(identifier_entropy),
+                        float(ngram_repetition),
+                    ]
+                rows.append(row)
+            except Exception as e:
+                print(f"  Warning: feature extraction failed for sample {i}: {e}")
+                rows.append([0.0] * len(feature_names))
+        
+        X = np.array(rows, dtype=np.float32)
+        print(f"  ✓ Extracted feature matrix: {X.shape}")
         return X
     
     def run_stratified_kfold(self, gptzero, detectgpt, codebert, n_splits=5):
@@ -853,8 +932,8 @@ class Part2Evaluator:
         print(f"    GPTZero <-> DetectGPT agreement: {100*avg_agreement:6.2f}% ± {100*std_agreement:4.2f}%")
         
         print(f"\n  Sample Categories (averaged):")
-        print(f"    Both predict AI:    {avg_both_ai:6.1f} (high confidence)")
-        print(f"    Both predict Human: {avg_both_human:6.1f} (high confidence)")
+        print(f"    Both predict AI:    {avg_both_ai:6.1f}")
+        print(f"    Both predict Human: {avg_both_human:6.1f}")
         print(f"    Conflict/Disagree:  {avg_conflict:6.1f} (needs review)")
         
         print(f"\n  Confidence-weighted Agreement (averaged):")
@@ -1245,9 +1324,13 @@ class ImprovedComparisonExperiment:
                 human_path
             )
             
-            # Extract features (optional - not implemented for now)
-            # X = self.part1_evaluator.extract_features(code_texts)
-            # self.part1_evaluator.X = X
+            # Extract features so CodeBERT can also participate in Part 1 5-fold.
+            X = self.part1_evaluator.extract_features(
+                code_texts,
+                analyzer=codebert.analyzer,
+                feature_names=codebert.feature_names
+            )
+            self.part1_evaluator.X = X
             
             fold_results = self.part1_evaluator.run_stratified_kfold(
                 gptzero, detectgpt, codebert, n_splits=5

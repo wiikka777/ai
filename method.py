@@ -5,6 +5,7 @@ import os
 import re
 from collections import Counter
 from transformers import AutoModelForMaskedLM, AutoTokenizer
+from glob import glob
 
 
 os.environ['HF_DATASETS_OFFLINE'] = '1'
@@ -29,20 +30,60 @@ class AICodeAnalyzer:
     def __init__(self, model_name="microsoft/codebert-base-mlm"):
         print(f"Loading model: {model_name} ...")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-       
+
+        model_source = self._resolve_local_model_source(model_name)
+        print(f"Using local model source: {model_source}")
+
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
+            model_source,
             local_files_only=True,
             trust_remote_code=True
         )
         self.model = AutoModelForMaskedLM.from_pretrained(
-            model_name,
+            model_source,
             trust_remote_code=True,
             local_files_only=True
         ).to(self.device)
         self.model.eval()
         print(f"Model loaded on device: {self.device}")
+
+    def _resolve_local_model_source(self, model_name: str) -> str:
+        """
+        Resolve a local model directory if present.
+        Falls back to HF model id when a local snapshot cannot be found.
+        """
+        if os.path.isdir(model_name):
+            return model_name
+
+        cache_roots = []
+        if 'HF_HOME' in os.environ:
+            cache_roots.append(os.environ['HF_HOME'])
+        if 'TRANSFORMERS_CACHE' in os.environ:
+            cache_roots.append(os.environ['TRANSFORMERS_CACHE'])
+
+        # Common local cache layouts on Windows/Linux.
+        candidates = []
+        for root in cache_roots:
+            if not root:
+                continue
+            candidates.extend([
+                os.path.join(root, 'models--microsoft--codebert-base-mlm'),
+                os.path.join(root, 'hub', 'models--microsoft--codebert-base-mlm'),
+            ])
+
+        # Prefer snapshot folders (contain config/tokenizer/model files).
+        for base in candidates:
+            if not os.path.isdir(base):
+                continue
+            snapshot_dirs = sorted(glob(os.path.join(base, 'snapshots', '*')))
+            for snap in reversed(snapshot_dirs):
+                if os.path.exists(os.path.join(snap, 'config.json')):
+                    return snap
+            # Fallback: if files were flattened directly under base.
+            if os.path.exists(os.path.join(base, 'config.json')):
+                return base
+
+        return model_name
 
     def compute_perplexity(self, code_snippet):
         """
